@@ -23,65 +23,85 @@ function toast(msg,type='success'){
   setTimeout(()=>{el.style.animation='toastOut .3s ease forwards';setTimeout(()=>el.remove(),300);},2500);
 }
 
-// ===== INDEXEDDB =====
-const DB_NAME='carometro_db';
-const DB_VERSION=1;
-const STORE='students';
-let db=null;
+// ===== SUPABASE =====
+const SUPABASE_URL = 'https://fgshtheyccdufbdufmpx.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZnc2h0aGV5Y2NkdWZiZHVmbXB4Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3ODExOTkxNiwiZXhwIjoyMDkzNjk1OTE2fQ.SI22rQH7SDA0NBmme3yo8iLqX-wUXFaT7aCstja4DSE';
+const STORAGE_BUCKET = 'student-photos';
+let db = null;
+const supabaseClient = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 function openDB(){
-  return new Promise((resolve,reject)=>{
-    const req=indexedDB.open(DB_NAME,DB_VERSION);
-    req.onupgradeneeded=e=>{
-      const db=e.target.result;
-      if(!db.objectStoreNames.contains(STORE)){
-        db.createObjectStore(STORE,{keyPath:'id'});
-      }
-    };
-    req.onsuccess=e=>{resolve(e.target.result);};
-    req.onerror=e=>{reject(e.target.error);};
-  });
+  return Promise.resolve(supabaseClient);
 }
 
-function dbGetAll(){
-  return new Promise((resolve,reject)=>{
-    const tx=db.transaction(STORE,'readonly');
-    const req=tx.objectStore(STORE).getAll();
-    req.onsuccess=()=>resolve(req.result);
-    req.onerror=()=>reject(req.error);
-  });
+function makePhotoURL(path){
+  if(!path) return null;
+  return supabaseClient.storage.from(STORAGE_BUCKET).getPublicUrl(path).data.publicUrl;
 }
 
-function dbPut(record){
-  return new Promise((resolve,reject)=>{
-    const tx=db.transaction(STORE,'readwrite');
-    const req=tx.objectStore(STORE).put(record);
-    req.onsuccess=()=>resolve();
-    req.onerror=()=>reject(req.error);
-  });
+async function dbGetAll(){
+  const { data, error } = await db
+    .from('students')
+    .select('id,name,photo_path')
+    .order('name', { ascending: true });
+
+  if(error) throw error;
+  return data || [];
 }
 
-function dbDelete(id){
-  return new Promise((resolve,reject)=>{
-    const tx=db.transaction(STORE,'readwrite');
-    const req=tx.objectStore(STORE).delete(id);
-    req.onsuccess=()=>resolve();
-    req.onerror=()=>reject(req.error);
-  });
+async function dbPut(record){
+  const { error } = await db
+    .from('students')
+    .upsert(record);
+  if(error) throw error;
+}
+
+async function dbDelete(id){
+  const { error } = await db
+    .from('students')
+    .delete()
+    .eq('id', id);
+  if(error) throw error;
+}
+
+async function uploadStudentPhoto(file, studentId){
+  if(!file || !studentId) return null;
+  const fileName = file.name.trim().replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_.-]/g, '') || 'file';
+  const path = `${studentId}/${Date.now()}-${fileName}`;
+  console.log('Supabase upload', STORAGE_BUCKET, path, file.type, file.size);
+  const { data, error } = await db
+    .storage
+    .from(STORAGE_BUCKET)
+    .upload(path, file, { cacheControl: '3600', upsert: true });
+
+  if(error){
+    console.error('Supabase upload error', { bucket: STORAGE_BUCKET, path, error });
+    throw error;
+  }
+  return data.path;
+}
+
+async function deleteStudentPhoto(path){
+  if(!path) return;
+  const { error } = await db
+    .storage
+    .from(STORAGE_BUCKET)
+    .remove([path]);
+  if(error) console.warn('Não foi possível remover foto do Storage:', error.message);
 }
 
 // ===== STATE =====
-// Each student: { id, name, photoBlob (Blob|null), photoURL (transient blob URL) }
+// Each student: { id, name, photoPath (string|null), photoURL (string|null) }
 let students=[];
 let editingId=null;
 let viewingId=null;
 let pendingDeleteId=null;
-let tempPhotoBlob=null;  // new blob from file input
+let tempPhotoFile=null;  // new file from file input
+let tempPhotoPath=null;
 let tempPhotoURL=null;   // blob URL for preview
 
 function uid(){return Date.now().toString(36)+Math.random().toString(36).slice(2,7);}
 function initials(name){return name.trim().split(/\s+/).slice(0,2).map(w=>w[0]?.toUpperCase()||'').join('');}
-function makeBlobURL(blob){return blob?URL.createObjectURL(blob):null;}
 
 // ===== DB STATUS =====
 function setDbStatus(state,text){
@@ -94,21 +114,22 @@ function setDbStatus(state,text){
 // ===== LOAD FROM DB =====
 async function loadFromDB(){
   try {
-    db=await openDB();
-    setDbStatus('','IndexedDB ativo');
-    const rows=await dbGetAll();
-    // Sort by name
-    rows.sort((a,b)=>a.name.localeCompare(b.name,'pt-BR'));
-    // Create blob URLs for display
-    students=rows.map(r=>({
-      ...r,
-      photoURL:makeBlobURL(r.photoBlob)
-    }));
+    db = await openDB();
+    setDbStatus('','Supabase ativo');
+    const rows = await dbGetAll();
+    students = rows.map(r=>(
+      {
+        id: r.id,
+        name: r.name,
+        photoPath: r.photo_path ?? null,
+        photoURL: makePhotoURL(r.photo_path)
+      }
+    ));
     renderGrid();
   } catch(err){
-    setDbStatus('error','Erro no banco');
-    console.error('IndexedDB error:',err);
-    toast('Erro ao abrir o banco de dados local.','error');
+    setDbStatus('error','Erro no Supabase');
+    console.error('Supabase error:',err);
+    toast('Erro ao conectar ao Supabase.','error');
   }
 }
 
@@ -156,7 +177,7 @@ function renderGrid(){
 
 // ===== ADD / EDIT MODAL =====
 function resetAddForm(){
-  editingId=null; tempPhotoBlob=null; tempPhotoURL=null;
+  editingId=null; tempPhotoFile=null; tempPhotoPath=null; tempPhotoURL=null;
   document.getElementById('name-input').value='';
   document.getElementById('photo-input').value='';
   document.getElementById('photo-preview').style.display='none';
@@ -181,8 +202,9 @@ function openEdit(id){
   document.getElementById('modal-add-title').textContent='Editar Aluno';
   document.getElementById('modal-add-save').textContent='Atualizar';
   document.getElementById('name-input').value=s.name;
-  if(s.photoBlob){
-    tempPhotoBlob=s.photoBlob;
+  if(s.photoPath){
+    tempPhotoPath=s.photoPath;
+    tempPhotoFile=null;
     tempPhotoURL=s.photoURL;
     document.getElementById('photo-preview').src=s.photoURL;
     document.getElementById('photo-preview').style.display='block';
@@ -202,9 +224,9 @@ document.getElementById('modal-add').addEventListener('click',e=>{if(e.target===
 
 document.getElementById('photo-input').addEventListener('change',function(){
   const file=this.files[0];if(!file)return;
-  if(tempPhotoURL&&tempPhotoURL.startsWith('blob:')&&tempPhotoBlob!==students.find(x=>x.id===editingId)?.photoBlob)
-    URL.revokeObjectURL(tempPhotoURL);
-  tempPhotoBlob=file;
+  if(tempPhotoURL&&tempPhotoURL.startsWith('blob:')) URL.revokeObjectURL(tempPhotoURL);
+  tempPhotoFile=file;
+  tempPhotoPath=null;
   tempPhotoURL=URL.createObjectURL(file);
   const p=document.getElementById('photo-preview');
   p.src=tempPhotoURL; p.style.display='block';
@@ -227,18 +249,32 @@ async function saveStudent(){
     if(editingId){
       const s=students.find(x=>x.id===editingId);
       if(s){
-        // revoke old URL if new photo
-        if(tempPhotoBlob!==s.photoBlob&&s.photoURL)URL.revokeObjectURL(s.photoURL);
-        s.name=name;
-        if(tempPhotoBlob!==s.photoBlob){s.photoBlob=tempPhotoBlob;s.photoURL=tempPhotoURL;}
-        await dbPut({id:s.id,name:s.name,photoBlob:s.photoBlob});
+        let photoPath = s.photoPath;
+        if(tempPhotoFile){
+          const newPhotoPath = await uploadStudentPhoto(tempPhotoFile, s.id);
+          if(newPhotoPath && photoPath && newPhotoPath !== photoPath){
+            await deleteStudentPhoto(photoPath);
+          }
+          photoPath = newPhotoPath;
+        }
+        s.name = name;
+        s.photoPath = photoPath;
+        s.photoURL = makePhotoURL(photoPath);
+        await dbPut({id:s.id, name:s.name, photo_path:s.photoPath});
         toast('Aluno atualizado!');
       }
     } else {
-      const newStudent={id:uid(),name,photoBlob:tempPhotoBlob,photoURL:tempPhotoURL};
+      const id = uid();
+      const photoPath = tempPhotoFile ? await uploadStudentPhoto(tempPhotoFile, id) : null;
+      const newStudent = {
+        id,
+        name,
+        photoPath,
+        photoURL: makePhotoURL(photoPath)
+      };
       students.push(newStudent);
       students.sort((a,b)=>a.name.localeCompare(b.name,'pt-BR'));
-      await dbPut({id:newStudent.id,name:newStudent.name,photoBlob:newStudent.photoBlob});
+      await dbPut({id:newStudent.id, name:newStudent.name, photo_path:newStudent.photoPath});
       toast('Aluno cadastrado!');
     }
     closeAddModal();
@@ -284,9 +320,10 @@ document.getElementById('modal-confirm-ok').addEventListener('click',async()=>{
   const idx=students.findIndex(x=>x.id===pendingDeleteId);
   if(idx!==-1){
     const s=students[idx];
-    if(s.photoURL)URL.revokeObjectURL(s.photoURL);
+    if(s.photoURL&&s.photoURL.startsWith('blob:')) URL.revokeObjectURL(s.photoURL);
     students.splice(idx,1);
     try{
+      if(s.photoPath) await deleteStudentPhoto(s.photoPath);
       await dbDelete(pendingDeleteId);
       toast('Aluno excluído.');
     } catch(err){
